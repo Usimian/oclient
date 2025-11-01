@@ -26,6 +26,7 @@ class OllamaGUI:
         self.gpu_var = tk.IntVar(value=99)  # 99 = full GPU
         self.stream_var = tk.BooleanVar(value=True)
         self.is_generating = False
+        self.auto_scroll = True  # Track if we should auto-scroll output
         
         # Available models
         self.available_models = []
@@ -107,13 +108,32 @@ class OllamaGUI:
                                                 font=("Arial", 9, "bold"), foreground="gray")
         self.stats_completion_label.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=2)
         
-        # Prompt input
-        prompt_frame = ttk.LabelFrame(self.root, text="Prompt", padding=10)
+        # Prompt input - split into two sections
+        prompt_frame = ttk.LabelFrame(self.root, text="Prompt & System Prompt", padding=10)
         prompt_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.prompt_entry = scrolledtext.ScrolledText(prompt_frame, height=4, wrap=tk.WORD)
+        # Create left and right frames
+        left_frame = ttk.Frame(prompt_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        right_frame = ttk.Frame(prompt_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        # Left side - User Prompt
+        ttk.Label(left_frame, text="Prompt:", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        self.prompt_entry = scrolledtext.ScrolledText(left_frame, height=4, width=40, wrap=tk.WORD)
         self.prompt_entry.pack(fill=tk.BOTH, expand=True)
         self.prompt_entry.insert("1.0", "Tell me a joke about programming")
+        
+        # Bind Enter to generate, Shift+Enter for line breaks
+        self.prompt_entry.bind("<Return>", self._on_prompt_enter)
+        self.prompt_entry.bind("<Shift-Return>", self._on_prompt_shift_enter)
+        
+        # Right side - System Prompt
+        ttk.Label(right_frame, text="System Prompt:", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        self.system_prompt_entry = scrolledtext.ScrolledText(right_frame, height=4, width=40, wrap=tk.WORD)
+        self.system_prompt_entry.pack(fill=tk.BOTH, expand=True)
+        self.system_prompt_entry.insert("1.0", "You are a helpful AI assistant named Bob.")
         
         # Generate button
         button_frame = ttk.Frame(self.root)
@@ -140,6 +160,18 @@ class OllamaGUI:
                                                      font=("Arial", 10))
         self.output_text.pack(fill=tk.BOTH, expand=True)
         
+        # Configure text tags for colored output
+        self.output_text.tag_config("time", foreground="blue")
+        self.output_text.tag_config("prompt", foreground="green", font=("Arial", 10, "italic"))
+        self.output_text.tag_config("response", foreground="black")
+        
+        # Bind scroll events to track user scrolling
+        self.output_text.bind("<MouseWheel>", self._on_scroll)
+        self.output_text.bind("<Button-4>", self._on_scroll)  # Linux scroll up
+        self.output_text.bind("<Button-5>", self._on_scroll)  # Linux scroll down
+        self.output_text.vbar.bind("<B1-Motion>", self._on_scrollbar_drag)
+        self.output_text.vbar.bind("<ButtonRelease-1>", self._on_scrollbar_release)
+        
     def load_models(self):
         """Load available models from Ollama"""
         try:
@@ -154,6 +186,52 @@ class OllamaGUI:
         except Exception as e:
             self.output_text.insert(tk.END, f"Error loading models: {e}\n")
             self.model_combo["values"] = ["gpt-oss:20b", "qwen3-coder"]
+    
+    def _is_at_bottom(self):
+        """Check if the output text scrollbar is at the bottom"""
+        # Get the current position of the scrollbar
+        position = self.output_text.yview()
+        # position[1] is 1.0 when at the bottom
+        return position[1] >= 0.99
+    
+    def _on_scroll(self, event):
+        """Handle mouse wheel scroll events"""
+        # If we're generating and currently at bottom, check if scrolling up
+        if self.is_generating and self.auto_scroll:
+            # Scrolling up disables auto-scroll
+            # On Linux: Button-4 = scroll up, Button-5 = scroll down
+            # On Windows/Mac: delta positive = scroll up
+            if hasattr(event, 'num'):  # Linux
+                if event.num == 4:  # Scroll up
+                    self.auto_scroll = False
+            elif hasattr(event, 'delta'):  # Windows/Mac
+                if event.delta > 0:  # Scroll up
+                    self.auto_scroll = False
+        # Check position after scroll completes
+        self.root.after(50, self._check_scroll_position)
+    
+    def _on_scrollbar_drag(self, event):
+        """Handle scrollbar dragging"""
+        self.root.after(10, self._check_scroll_position)
+    
+    def _on_scrollbar_release(self, event):
+        """Handle scrollbar release"""
+        self.root.after(10, self._check_scroll_position)
+    
+    def _check_scroll_position(self):
+        """Check scroll position and update auto_scroll flag"""
+        if self.is_generating:
+            self.auto_scroll = self._is_at_bottom()
+    
+    def _on_prompt_enter(self, event):
+        """Handle Enter key in prompt - trigger generation"""
+        self.generate()
+        return "break"  # Prevent default newline insertion
+    
+    def _on_prompt_shift_enter(self, event):
+        """Handle Shift+Enter in prompt - insert newline"""
+        # Allow default behavior (insert newline)
+        return None
     
     def update_status(self, message, color="black"):
         """Update status label"""
@@ -220,22 +298,26 @@ class OllamaGUI:
         
         # Disable controls
         self.is_generating = True
+        self.auto_scroll = True  # Reset auto-scroll for new generation
         self.generate_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.update_status("Generating...", "blue")
         
-        # Clear output
-        self.output_text.insert(tk.END, f"\n{'='*70}\n")
-        self.output_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] Prompt: {prompt}\n")
-        self.output_text.insert(tk.END, f"{'='*70}\n")
+        # Get system prompt
+        system_prompt = self.system_prompt_entry.get("1.0", tk.END).strip()
+        
+        # Display prompt with colored text
+        self.output_text.insert(tk.END, "\n")
+        self.output_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] ", "time")
+        self.output_text.insert(tk.END, f"Prompt: {prompt}\n", "prompt")
         self.output_text.see(tk.END)
         
         # Start generation thread
-        thread = threading.Thread(target=self._generate_thread, args=(prompt,))
+        thread = threading.Thread(target=self._generate_thread, args=(prompt, system_prompt))
         thread.daemon = True
         thread.start()
     
-    def _generate_thread(self, prompt):
+    def _generate_thread(self, prompt, system_prompt):
         """Thread function for generation"""
         try:
             model = self.model_var.get()
@@ -248,6 +330,10 @@ class OllamaGUI:
                 "prompt": prompt,
                 "stream": stream,
             }
+            
+            # Add system prompt if provided
+            if system_prompt:
+                payload["system"] = system_prompt
             
             if num_gpu is not None:
                 payload["options"] = {"num_gpu": num_gpu}
@@ -306,8 +392,10 @@ class OllamaGUI:
     
     def _append_output(self, text):
         """Append text to output (called from main thread)"""
-        self.output_text.insert(tk.END, text)
-        self.output_text.see(tk.END)
+        self.output_text.insert(tk.END, text, "response")
+        # Only auto-scroll if the flag is set
+        if self.auto_scroll:
+            self.output_text.see(tk.END)
     
     def _generation_complete(self):
         """Called when generation is complete"""
